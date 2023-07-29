@@ -8,7 +8,8 @@ from tqdm import tqdm
 import os
 import matplotlib.pyplot as plt
 import copy
-
+from torch import optim
+from torch.nn import functional as F
 
 # Set up device
 # device = torch.device("mps")
@@ -127,7 +128,7 @@ class Config:
         self.num_epochs = 10
         #self.state_size = None
         #self.action_size = None
-        self.replay_buffer_capacity = 10000
+        self.replay_buffer_capacity = 1
         self.alpha = 0.6
         self.beta = 0.4
         self.beta_increment = 0.001
@@ -139,7 +140,7 @@ class Config:
         self.gradient_clip = 40.0
         self.max_moves = 27000
         self.mcts_discount = self.discount
-        self.episodes = 1000
+        self.episodes = 100000
         self.gamma = 0  # Discount factor for the Bellman equation
         self.lr_repr = 0.0001
         self.lr_dyn = 0.0001
@@ -307,7 +308,7 @@ class PrioritizedReplayBuffer:
 
 
 class Agent:
-    def __init__(self, env, config, input_size, representation_size, prediction_function):
+    def __init__(self, env, config, input_size, representation_size, representation_function, dynamics_function ,prediction_function):
         self.env = env
         self.config = config
         self.input_size = input_size
@@ -315,11 +316,17 @@ class Agent:
         self.dynamics_function = dynamics_function
         self.prediction_function = prediction_function
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.action_space = self._create_action_space()
+        self.model_paths = {
+            "representation": "representation_model.pth",
+            "dynamics": "dynamics_model.pth",
+            "prediction": "prediction_model.pth"
+        }
 
         # Initialize target networks
-        self.target_representation_function = representation_function.clone()
-        self.target_dynamics_function = dynamics_function.clone()
-        self.target_prediction_function = prediction_function.clone()
+        self.target_representation_function = copy.deepcopy(representation_function)
+        self.target_dynamics_function = copy.deepcopy(dynamics_function)
+        self.target_prediction_function = copy.deepcopy(prediction_function)
 
         # Set target networks in evaluation mode (no gradients)
         self.target_representation_function.eval()
@@ -343,7 +350,7 @@ class Agent:
         )
 
         # Create a replay buffer
-        self.replay_buffer = PrioritizedReplayBuffer(self.config.replay_buffer_size)
+        self.replay_buffer = PrioritizedReplayBuffer(self.config.replay_buffer_capacity)
 
         # Initialize other variables
         self.best_reward = float("-inf")
@@ -438,7 +445,7 @@ class Agent:
                 action = torch.argmax(policies_pred).item()
 
             # Take a step in the environment
-            next_state, reward, done, _ = agent.env.step(action)
+            next_state, reward, done, _, _ = agent.env.step(action)
             next_state = torch.tensor(next_state, dtype=torch.float32, device=agent.device).unsqueeze(0)
             total_reward += reward
 
@@ -454,29 +461,44 @@ class Agent:
         return total_reward
 
 
-
     def compute_loss(self, states, actions, rewards, next_states, dones, weights):
-        states = torch.tensor(states, dtype=torch.float32, device=self.device)
-        actions = torch.tensor(actions, dtype=torch.long, device=self.device).unsqueeze(1)
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-        next_states = torch.tensor(next_states, dtype=torch.float32, device=self.device)
-        dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
-        weights = torch.tensor(weights, dtype=torch.float32, device=self.device)
+        # Convert to tensor if necessary
+        states = tuple(torch.tensor(s, dtype=torch.float32, device=self.device) for s in states)
+        actions = tuple(torch.tensor(a, dtype=torch.long, device=self.device) for a in actions)
+        rewards = tuple(torch.tensor(r, dtype=torch.float32, device=self.device) for r in rewards)
+        next_states = tuple(torch.tensor(ns, dtype=torch.float32, device=self.device) for ns in next_states)
+        dones = tuple(torch.tensor(d, dtype=torch.float32, device=self.device) for d in dones)
+        weights = tuple(torch.tensor(w, dtype=torch.float32, device=self.device) for w in weights)
 
-        # Compute TD targets
-        with torch.no_grad():
-            next_state_repr = self.target_representation_function(next_states)
-            _, next_state_values = self.target_prediction_function(next_state_repr)
-            td_targets = rewards + self.gamma * (1 - dones) * next_state_values
+        losses = []
+        for state, action, reward, next_state, done, weight in zip(states, actions, rewards, next_states, dones, weights):
+            # Compute the current Q values
+            current_state_repr = self.representation_function(state)
+            current_policies, current_values = self.prediction_function(current_state_repr)
+            current_q_values = torch.sum(current_policies * current_values, dim=1)
 
-        # Compute TD errors and loss
-        state_repr = self.representation_function(states)
-        rewards_pred, values_pred = self.prediction_function(state_repr)
-        state_values = values_pred.gather(1, actions)
-        td_errors = td_targets - state_values.squeeze()
-        loss = (weights * F.smooth_l1_loss(rewards_pred, td_targets.detach(), reduction='none')).mean()
+            # Compute the next Q values
+            next_state_repr = self.target_representation_function(torch.stack(next_states))
+            _, next_values = self.target_prediction_function(next_state_repr)
+            next_q_values = torch.max(next_values, dim=1)[0]
+
+            # Compute the expected Q values
+            expected_q_values = reward + (self.gamma * next_q_values * (1 - done))
+
+            # Compute the Huber loss
+            loss = F.smooth_l1_loss(current_q_values, expected_q_values.detach(), reduction='none')
+
+            # Apply the importance sampling weights
+            loss *= weight
+
+            losses.append(loss)
+
+        # Average the loss over all samples
+        loss = torch.mean(torch.stack(losses))
 
         return loss
+
+
 
     # Reward Function
     def compute_reward_cartpole(self, next_state):
@@ -563,12 +585,13 @@ class Agent:
 
     def train(self, episodes=config.episodes):
         pbar = tqdm(range(episodes), desc="Episodes")
+        initial_state, _ = self.env.reset()
         running_reward = 0
         running_rewards = []
         losses = []
 
         for episode in pbar:
-            total_reward = self.run_simulation()
+            total_reward = self.run_simulation(initial_state)
             running_reward = 0.05 * total_reward + (1 - 0.05) * running_reward
             running_rewards.append(running_reward)
 
@@ -617,6 +640,7 @@ class Agent:
         plt.title('Loss Over Time')
         plt.xlabel('Episode')
         plt.ylabel('LossCompleting the `train_representation` function: ')
+        plt.show()
 
 
     def load_model(self):
@@ -633,11 +657,29 @@ class Agent:
     
 
     def compute_td_errors(self, states, actions, rewards, next_states, dones):
-        states = torch.tensor(states, dtype=torch.float32, device=self.device)
-        actions = torch.tensor(actions, dtype=torch.long, device=self.device).unsqueeze(1)
+        print("type states: ",type(states))
+        print("type states 1:", type(states[0]))
+        print("type actions: ",type(actions))
+        print("type actions 1:", type(actions[0]))
+        print("type rewards: ",type(rewards))
+        print("type rewards 1:", type(rewards[0]))
+        print("type next_states: ",type(next_states))
+        print("type next_states 1:", type(next_states[0]))
+        print("type dones: ",type(dones))
+        print("type dones 1:", type(dones[0]))
+        #states = torch.tensor(states, dtype=torch.float32, device=self.device)
+        #rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        #next_states = torch.tensor(next_states, dtype=torch.float32, device=self.device)
+        #dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+        states = states[0]
+        actions = actions[0]
+        rewards = rewards[0]
+        next_states = next_states[0]
+        dones = dones[0]
+
+        actions = torch.tensor(actions, dtype=torch.long, device=self.device)
         rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-        next_states = torch.tensor(next_states, dtype=torch.float32, device=self.device)
-        dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+
         next_state_repr = self.target_representation_function(next_states)
         _, next_state_values = self.target_prediction_function(next_state_repr)
         target_values = rewards + self.gamma * (1 - dones) * next_state_values
@@ -652,7 +694,9 @@ if __name__ == "__main__":
     env = gym.make("LunarLander-v2")
     input_size = env.observation_space.shape[0]
     representation_size = 64
+    representaion_function = RepresentationFunction(input_size, representation_size)
+    dyncamics_function = DynamicsFunction()
     prediction_function = PredictionFunction(env.action_space.n)
     config = Config()
-    agent = Agent(env, config, input_size, representation_size=representation_size, prediction_function=prediction_function)
+    agent = Agent(env, config, input_size, representation_size=representation_size,representation_function=representaion_function, prediction_function=prediction_function, dynamics_function=dyncamics_function)
     agent.train()
